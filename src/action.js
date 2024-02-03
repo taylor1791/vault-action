@@ -8,28 +8,12 @@ const { WILDCARD } = require('./constants');
 
 const { auth: { retrieveToken }, secrets: { getSecrets } } = require('./index');
 
+const VAULT_TOKEN_STATE = "VAULT_TOKEN";
 const AUTH_METHODS = ['approle', 'token', 'github', 'jwt', 'kubernetes', 'ldap', 'userpass'];
 const ENCODING_TYPES = ['base64', 'hex', 'utf8'];
 
-async function exportSecrets() {
+function getDefaultOptions() {
     const vaultUrl = core.getInput('url', { required: true });
-    const vaultNamespace = core.getInput('namespace', { required: false });
-    const extraHeaders = parseHeadersInput('extraHeaders', { required: false });
-    const exportEnv = core.getInput('exportEnv', { required: false }) != 'false';
-    const outputToken = (core.getInput('outputToken', { required: false }) || 'false').toLowerCase() != 'false';
-    const exportToken = (core.getInput('exportToken', { required: false }) || 'false').toLowerCase() != 'false';
-
-    const secretsInput = core.getInput('secrets', { required: false });
-    const secretRequests = parseSecretsInput(secretsInput);
-
-    const secretEncodingType = core.getInput('secretEncodingType', { required: false });
-
-    const vaultMethod = (core.getInput('method', { required: false }) || 'token').toLowerCase();
-    const authPayload = core.getInput('authPayload', { required: false });
-    if (!AUTH_METHODS.includes(vaultMethod) && !authPayload) {
-        throw Error(`Sorry, the provided authentication method ${vaultMethod} is not currently supported and no custom authPayload was provided.`);
-    }
-
     const defaultOptions = {
         prefixUrl: vaultUrl,
         headers: {},
@@ -44,6 +28,8 @@ async function exportSecrets() {
         }
     }
 
+    const extraHeaders = parseHeadersInput('extraHeaders', { required: false });
+    const vaultNamespace = core.getInput('namespace', { required: false });
     const tlsSkipVerify = (core.getInput('tlsSkipVerify', { required: false }) || 'false').toLowerCase() != 'false';
     if (tlsSkipVerify === true) {
         defaultOptions.https.rejectUnauthorized = false;
@@ -56,12 +42,12 @@ async function exportSecrets() {
 
     const clientCertificateRaw = core.getInput('clientCertificate', { required: false });
     if (clientCertificateRaw != null) {
-	    defaultOptions.https.certificate = Buffer.from(clientCertificateRaw, 'base64').toString();
+        defaultOptions.https.certificate = Buffer.from(clientCertificateRaw, 'base64').toString();
     }
 
     const clientKeyRaw = core.getInput('clientKey', { required: false });
     if (clientKeyRaw != null) {
-	    defaultOptions.https.key = Buffer.from(clientKeyRaw, 'base64').toString();
+        defaultOptions.https.key = Buffer.from(clientKeyRaw, 'base64').toString();
     }
 
     for (const [headerName, headerValue] of extraHeaders) {
@@ -72,8 +58,32 @@ async function exportSecrets() {
         defaultOptions.headers["X-Vault-Namespace"] = vaultNamespace;
     }
 
+    return defaultOptions
+}
+
+async function exportSecrets() {
+    const exportEnv = core.getInput('exportEnv', { required: false }) != 'false';
+    const revokeToken = core.getInput("revokeToken", { required: false }) !== 'false'
+    const outputToken = (core.getInput('outputToken', { required: false }) || 'false').toLowerCase() != 'false';
+    const exportToken = (core.getInput('exportToken', { required: false }) || 'false').toLowerCase() != 'false';
+
+    const secretsInput = core.getInput('secrets', { required: false });
+    const secretRequests = parseSecretsInput(secretsInput);
+
+    const secretEncodingType = core.getInput('secretEncodingType', { required: false });
+
+    const vaultMethod = (core.getInput('method', { required: false }) || 'token').toLowerCase();
+    const authPayload = core.getInput('authPayload', { required: false });
+    if (!AUTH_METHODS.includes(vaultMethod) && !authPayload) {
+        throw Error(`Sorry, the provided authentication method ${vaultMethod} is not currently supported and no custom authPayload was provided.`);
+    }
+
+    const defaultOptions = getDefaultOptions();
     const vaultToken = await retrieveToken(vaultMethod, got.extend(defaultOptions));
     core.setSecret(vaultToken)
+    if (revokeToken) {
+        core.saveState(VAULT_TOKEN_STATE, vaultToken)
+    }
     defaultOptions.headers['X-Vault-Token'] = vaultToken;
     const client = got.extend(defaultOptions);
 
@@ -81,7 +91,7 @@ async function exportSecrets() {
       core.setOutput('vault_token', `${vaultToken}`);
     }
     if (exportToken === true) {
-        core.exportVariable('VAULT_TOKEN', `${vaultToken}`);
+      core.exportVariable('VAULT_TOKEN', `${vaultToken}`);
     }
 
     const requests = secretRequests.map(request => {
@@ -219,9 +229,55 @@ function parseHeadersInput(inputKey, inputOptions) {
         }, new Map());
 }
 
+async function revokeToken() {
+    const token = core.getState(VAULT_TOKEN_STATE)
+    if (!token || token === "") {
+        core.debug(`provided token in state (${VAULT_TOKEN_STATE}) is empty. skipping...`)
+        return
+    }
+    core.setSecret(token)
+
+    const defaultOptions = getDefaultOptions();
+    defaultOptions.headers['X-Vault-Token'] = token;
+    const client = got.extend(defaultOptions);
+    try {
+        await revokeClientToken(client)
+    } catch (err) {
+        throw err
+    }
+}
+
+/**
+  * @param {import('got').Got} client
+  */
+async function revokeClientToken(client) {
+    const path = "v1/auth/token/revoke-self"
+    /** @type {'json'} */
+    const responseType = 'json';
+    var options = {
+        responseType,
+    };
+
+    core.debug(`Revoking Vault Token from ${path} endpoint`);
+
+    let response;
+    try {
+        response = await client.post(path, options);
+    } catch (err) {
+        if (err instanceof got.HTTPError) {
+            throw Error(`failed to revoke vault token. code: ${err.code}, message: ${err.message}, vaultResponse: ${JSON.stringify(err.response.body)}`)
+        } else {
+            throw err
+        }
+    }
+    core.debug('✔ Vault Token successfully revoked');
+}
+
 module.exports = {
     exportSecrets,
     parseSecretsInput,
     parseHeadersInput,
+    getDefaultOptions,
+    revokeToken,
+    VAULT_TOKEN_STATE
 };
-
